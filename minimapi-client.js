@@ -1,12 +1,20 @@
 class MinimAPI {
 	constructor(api_url, model_url=null){
 		this.api_url = api_url
-		this.#load_model(model_url || api_url + 'model.json')
+		this.model_url = (model_url || api_url + 'model.json')
+		this.#load_model()
 	}
 
 	async set_encryption(key){
-		this.crypto = new Minimapi_crypto()
+		this.crypto = new MinimAPI_crypto()
 		this.crypto.load_key(key)
+	}
+
+	async auth(auth_class, auth_data){
+		this.auth = new auth_class()
+		return this.auth.login(auth_data).then(() => {
+			return this.#load_model()
+		})
 	}
 
 	list(type){
@@ -34,22 +42,18 @@ class MinimAPI {
 		return this.#request('DELETE', this.api_url+type+'/'+id, null, type)
 	}
 
-	#load_model(model_url){
-		const xhr = new XMLHttpRequest()
-		xhr.open('GET', model_url, false)
-		xhr.send(null)
-		if (xhr.status !== 200) {
-			return
-		}
-		let model = JSON.parse(xhr.responseText)
-		for(var type in model){
-			for(var property in model[type]){
-				if(!model[type][property].hasOwnProperty('tags')){
-					model[type][property]['tags'] = []
+	#load_model(){
+		return this.#request('GET', this.model_url).then((result) => {
+			let model = result
+			for(var type in model){
+				for(var property in model[type]){
+					if(!model[type][property].hasOwnProperty('tags')){
+						model[type][property]['tags'] = []
+					}
 				}
 			}
-		}
-		this.model = model
+			this.model = model
+		})
 	}
 
 	async #request(method, path, data=null, data_type=null){
@@ -126,12 +130,19 @@ class MinimAPI {
 			};
 			xhr.open(method, path, true)
 			xhr.setRequestHeader('Content-Type', 'application/json')
-			xhr.send((data)?JSON.stringify(data):null)
+			if('auth' in that && 'get_auth_header' in that.auth){
+				that.auth.get_auth_header(method, path, (data)?JSON.stringify(data):null).then((header_value) => {
+					xhr.setRequestHeader('Authorization', header_value)
+					xhr.send((data)?JSON.stringify(data):null)
+				})
+			}else{
+				xhr.send((data)?JSON.stringify(data):null)
+			}
 		})
 	}
 }
 
-class Minimapi_crypto {
+class MinimAPI_crypto {
 	buf2hex(buffer){
 		return Array.prototype.map.call(new Uint8Array(buffer), x => ('00' + x.toString(16)).slice(-2)).join('')
 	}
@@ -181,6 +192,122 @@ class Minimapi_crypto {
 			this.hex2buf(cipher.split(',')[1])
 		).then((plain) => {
 			return new TextDecoder("utf-8").decode(plain)
+		})
+	}
+}
+
+class MinimAPI_auth{
+	get_auth_header(method, path, data){
+		return new Promise(function (resolve, reject) {
+			resolve(null)
+		})
+	}
+
+	login(auth_data){
+		return this.request('/api/auth', auth_data).then((result) => {
+			this.handle_login_result(result)
+		})
+	}
+
+	handle_login_result(result){}
+
+	async request(path, data=null){
+		return new Promise(function (resolve, reject) {
+			const xhr = new XMLHttpRequest()
+			xhr.onload = async function(){
+				if(xhr.status == 200){
+					if(xhr.responseText.length){
+						resolve(JSON.parse(xhr.responseText))
+					}else{
+						resolve(null)
+					}
+				}else{
+					reject({
+						status: xhr.status,
+						statusText: xhr.statusText
+					});
+				}
+			}
+			xhr.onerror = function () {
+				reject({
+					status: xhr.status,
+					statusText: xhr.statusText
+				});
+			};
+			xhr.open('POST', path, true)
+			xhr.setRequestHeader('Content-Type', 'application/json')
+			xhr.send((data)?JSON.stringify(data):null)
+		})
+	}
+}
+
+class MinimAPI_auth_token_based extends MinimAPI_auth {
+	get_auth_header(method, path, data){
+		let token = this.token
+		return new Promise(function (resolve, reject) {
+			resolve(token)
+		})
+	}
+}
+
+class MinimAPI_auth_bearer extends MinimAPI_auth_token_based {
+	login(auth_data){
+		this.token = auth_data
+	}
+}
+
+class MinimAPI_auth_jwt extends MinimAPI_auth_token_based {
+	handle_login_result(result){
+		this.token = result.token
+	}
+}
+
+class MinimAPI_auth_ecdsa extends MinimAPI_auth {
+	buf2hex(buffer){
+		return Array.prototype.map.call(new Uint8Array(buffer), x => ('00' + x.toString(16)).slice(-2)).join('')
+	}
+
+	hex2buf(string) {
+		return new Uint8Array(string.match(/.{1,2}/g).map(byte => parseInt(byte, 16)))
+	}
+
+	#generate_keys(){
+		return window.crypto.subtle.generateKey({
+			name: "ECDSA",
+			namedCurve: "P-521",
+		}, false, ['sign', 'verify'])
+	}
+
+	login(auth_data){
+		return this.#generate_keys().then((keys) => {
+			this.keys = keys
+			return window.crypto.subtle.exportKey("raw", keys.publicKey)
+		}).then((raw_public_key) => {
+			this.hex_public_key = this.buf2hex(raw_public_key)
+			auth_data.public_key = this.hex_public_key
+			return this.request('/api/auth', auth_data)
+		}).then((result) => {
+			this.handle_login_result(result)
+		})
+	}
+
+	handle_login_result(result){
+		this.auth_id = result.id
+	}
+
+	get_auth_header(method, path, data){
+		let url = new URL(path, window.location.protocol + "//" + window.location.host)
+		let timestamp = String(Math.floor(Date.now()/1000))
+		let payload = timestamp+method+url.pathname+url.search+((data)?data:'')
+		return window.crypto.subtle.sign(
+			{
+			    name: "ECDSA",
+			    hash: {name: "SHA-512"},
+			},
+			this.keys.privateKey,
+			new TextEncoder("utf-8").encode(payload)
+		).then((signature) => {
+			return this.auth_id+'.'+this.buf2hex(new Uint8Array(signature))+'.'+timestamp
 		})
 	}
 }
