@@ -9,6 +9,24 @@ class MinimAPI {
 		await this.crypto.load_key(secret)
 	}
 
+	async change_encryption_key(new_secret){
+		await this.crypto.load_new_key(new_secret)
+		for(var type in this.model){
+			if(Object.values(this.model[type]).filter((t) => t.tags.includes('encrypted')).length){
+				let index = await this.list(type)
+				let i = 0
+				for(let row of index){
+					i++
+					console.log(`${type} / ${row.id} -> ${i}/${index.length}`)
+					let data = await this.read(type, row.id)
+					await this.update(type, row.id, data[0])
+				}
+			}
+		}
+		await this.crypto.unload_new_key()
+		console.log('Done')
+	}
+
 	async init(){
 		await this.#load_model()
 	}
@@ -16,7 +34,7 @@ class MinimAPI {
 	async auth(auth_class=null, auth_data=null){
 		if(auth_class){
 			this.auth = new auth_class()
-			await this.auth.login(auth_data)
+			await this.auth.login(this.api_url, auth_data)
 		}
 	}
 
@@ -65,7 +83,7 @@ class MinimAPI {
 		// Encrypt data to send if defined in model
 		if(data && data_type){
 			for(var property in data){
-				if(this.model[data_type][property].tags.includes('encrypted')){
+				if(data[property] && this.model[data_type][property].tags.includes('encrypted')){
 					data[property] = await this.crypto.encrypt(data[property])
 				}
 			}
@@ -75,8 +93,8 @@ class MinimAPI {
 		if(path.includes('?') && data_type){
 			var url_param = new URLSearchParams(path.split('?')[1])
 			for(const [key, value] of url_param){
-				if(this.model[data_type][key].tags.includes('encrypted')){
-					url_param.set(key, await this.crypto.encrypt(data[property]))
+				if(value && this.model[data_type][key].tags.includes('encrypted')){
+					url_param.set(key, await this.crypto.encrypt(value))
 				}
 			}
 			path = path.split('?')[0]+'?'+url_param.toString()
@@ -102,6 +120,13 @@ class MinimAPI {
 				if(xhr.status == expected_status[method]){
 					if(xhr.responseText.length){
 						var data = JSON.parse(xhr.responseText)
+
+						if(method == 'PUT' && that.hasOwnProperty('crypto')){
+							if(that.crypto.is_key_change_in_progress()){
+								resolve(null)
+								return
+							}
+						}
 
 						// Decrypt data if defined in model
 						if(data_type){
@@ -148,49 +173,74 @@ class MinimAPI {
 class MinimAPI_crypto {
 	static encryption_algo = 'AES-CBC'
 
-	buf2hex(buffer){
+	#buf2hex(buffer){
 		return Array.prototype.map.call(new Uint8Array(buffer), x => ('00' + x.toString(16)).slice(-2)).join('')
 	}
 
-	hex2buf(string) {
+	#hex2buf(string) {
 		return new Uint8Array(string.match(/.{1,2}/g).map(byte => parseInt(byte, 16)))
+	}
+
+	async #derive_secret(secret){
+		return await window.crypto.subtle.digest(
+			{name: "SHA-256"},
+			new Uint8Array(new TextEncoder().encode(secret))
+		)
 	}
 	
 	async load_key(secret){
+		let derived_secret = await this.#derive_secret(secret)
 		this.key = await window.crypto.subtle.importKey(
 			'raw',
-			new Uint8Array(new TextEncoder().encode(secret)),
-			'AES-CBC',
-			false,
+			derived_secret,
+			this.constructor.encryption_algo,
+			true,
 			['encrypt', 'decrypt']
 		)
 	}
 
-	generate_iv(){
+	is_key_change_in_progress(){
+		return this.hasOwnProperty('new_key')
+	}
+
+	async load_new_key(new_secret){
+		let current_key = this.key
+		await this.load_key(new_secret)
+		this.new_key = this.key
+		this.key = current_key
+	}
+
+	unload_new_key(){
+		this.key = this.new_key
+		delete this.new_key
+	}
+
+	#generate_iv(){
 		return window.crypto.getRandomValues(new Uint8Array(16))
 	}
 
 	async encrypt(plaintext){
-		let iv = this.generate_iv()
+		let key = this.hasOwnProperty('new_key')?this.new_key:this.key
+		let iv = this.#generate_iv()
 		let ciphertext = await window.crypto.subtle.encrypt(
 			{
 				name: this.constructor.encryption_algo,
 				iv: iv
 			},
-			this.key,
+			key,
 			new TextEncoder('utf-8').encode(plaintext)
 		)
-		return this.buf2hex(iv)+','+this.buf2hex(cipher)
+		return this.#buf2hex(iv)+','+this.#buf2hex(ciphertext)
 	}
 
 	async decrypt(cipher){
 		let plaintext = await window.crypto.subtle.decrypt(
 			{
 				name: this.constructor.encryption_algo,
-				iv: this.hex2buf(cipher.split(',')[0])
+				iv: this.#hex2buf(cipher.split(',')[0])
 			},
 			this.key,
-			this.hex2buf(cipher.split(',')[1])
+			this.#hex2buf(cipher.split(',')[1])
 		)
 		return new TextDecoder('utf-8').decode(plaintext)
 	}
@@ -201,8 +251,8 @@ class MinimAPI_auth{
 		return ''
 	}
 
-	async login(auth_data){
-		let result = await this.request('/api/auth', auth_data)
+	async login(api_url, auth_data){
+		let result = await this.request(api_url+'auth', auth_data)
 		this.handle_login_result(result)
 	}
 
@@ -245,7 +295,7 @@ class MinimAPI_auth_token_based extends MinimAPI_auth {
 }
 
 class MinimAPI_auth_bearer extends MinimAPI_auth_token_based {
-	login(auth_data){
+	login(api_url, auth_data){
 		this.token = auth_data
 	}
 }
@@ -264,11 +314,15 @@ class MinimAPI_auth_ecdsa extends MinimAPI_auth {
 	}
 	static wrapping_algo = 'AES-GCM'
 
-	buf2hex(buffer){
+	static is_keys_saved(){
+		return Boolean(localStorage.getItem('keys'))
+	}
+
+	#buf2hex(buffer){
 		return Array.prototype.map.call(new Uint8Array(buffer), x => ('00' + x.toString(16)).slice(-2)).join('')
 	}
 
-	hex2buf(string) {
+	#hex2buf(string) {
 		return new Uint8Array(string.match(/.{1,2}/g).map(byte => parseInt(byte, 16)))
 	}
 
@@ -276,7 +330,7 @@ class MinimAPI_auth_ecdsa extends MinimAPI_auth {
 		return window.crypto.subtle.generateKey(this.constructor.keys_parameters, true, ['sign', 'verify'])
 	}
 
-	async derive_shortpass(shortpass, salt, iterations){
+	async #derive_shortpass(shortpass, salt, iterations){
 		let shortpass_key = await window.crypto.subtle.importKey(
 			'raw',
 			new Uint8Array(new TextEncoder().encode(shortpass)),
@@ -287,7 +341,7 @@ class MinimAPI_auth_ecdsa extends MinimAPI_auth {
 		return await window.crypto.subtle.deriveKey(
 			{
 				'name': 'PBKDF2',
-				salt: this.hex2buf(salt),
+				salt: this.#hex2buf(salt),
 				iterations: iterations,
 				hash: {name: 'SHA-512'},
 			},
@@ -301,26 +355,26 @@ class MinimAPI_auth_ecdsa extends MinimAPI_auth {
 		)
 	}
 
-	async wrap_key(key, wrapping_key, iv){
+	async #wrap_key(key, wrapping_key, iv){
 		return await window.crypto.subtle.wrapKey(
 			'jwk',
 			key,
 			wrapping_key,
 			{
 				name: this.constructor.wrapping_algo,
-				iv: this.hex2buf(iv)
+				iv: this.#hex2buf(iv)
 			}
 		)
 	}
 
-	async unwrap_key(wrapped_key, unwrapping_key, iv, actions){
+	async #unwrap_key(wrapped_key, unwrapping_key, iv, actions){
 		return await window.crypto.subtle.unwrapKey(
 			'jwk',
-			this.hex2buf(wrapped_key),
+			this.#hex2buf(wrapped_key),
 			unwrapping_key,
 			{
 				name: this.constructor.wrapping_algo,
-				iv: this.hex2buf(iv)
+				iv: this.#hex2buf(iv)
 			},
 			this.constructor.keys_parameters,
 			true,
@@ -331,27 +385,27 @@ class MinimAPI_auth_ecdsa extends MinimAPI_auth {
 	async save_keys(shortpass){
 		this.saved_data = {
 			derivation_parameters: {
-				salt: this.buf2hex(window.crypto.getRandomValues(new Uint8Array(16))),
+				salt: this.#buf2hex(window.crypto.getRandomValues(new Uint8Array(16))),
 				iterations: Math.floor(Math.random() * (2000 - 1000 + 1) + 1000)
 			},
 			private_key: {
-				iv: this.buf2hex(window.crypto.getRandomValues(new Uint8Array(16))),
+				iv: this.#buf2hex(window.crypto.getRandomValues(new Uint8Array(16))),
 				wrapped_private_key: null
 			},
 			public_key: {
-				iv: this.buf2hex(window.crypto.getRandomValues(new Uint8Array(16))),
+				iv: this.#buf2hex(window.crypto.getRandomValues(new Uint8Array(16))),
 				wrapped_public_key: null
 			},
 			auth_id: this.auth_id
 		}
 		
-		let derived_key = await this.derive_shortpass(shortpass, this.saved_data.derivation_parameters.salt, this.saved_data.derivation_parameters.iterations)
+		let derived_key = await this.#derive_shortpass(shortpass, this.saved_data.derivation_parameters.salt, this.saved_data.derivation_parameters.iterations)
 
-		let wrapped_private_key = await this.wrap_key(this.keys.privateKey, derived_key, this.saved_data.private_key.iv)
-		this.saved_data.private_key.wrapped_private_key = this.buf2hex(wrapped_private_key)
+		let wrapped_private_key = await this.#wrap_key(this.keys.privateKey, derived_key, this.saved_data.private_key.iv)
+		this.saved_data.private_key.wrapped_private_key = this.#buf2hex(wrapped_private_key)
 
-		let wrapped_public_key = await this.wrap_key(this.keys.publicKey, derived_key, this.saved_data.public_key.iv)
-		this.saved_data.public_key.wrapped_public_key = this.buf2hex(wrapped_public_key)
+		let wrapped_public_key = await this.#wrap_key(this.keys.publicKey, derived_key, this.saved_data.public_key.iv)
+		this.saved_data.public_key.wrapped_public_key = this.#buf2hex(wrapped_public_key)
 
 		delete this.saved_data.derived_key
 		localStorage.setItem('keys', JSON.stringify(this.saved_data))
@@ -361,23 +415,22 @@ class MinimAPI_auth_ecdsa extends MinimAPI_auth {
 		this.keys = {}
 		this.saved_data = JSON.parse(localStorage.getItem('keys'))
 		
-		let derived_key = await this.derive_shortpass(shortpass, this.saved_data.derivation_parameters.salt, this.saved_data.derivation_parameters.iterations)
+		let derived_key = await this.#derive_shortpass(shortpass, this.saved_data.derivation_parameters.salt, this.saved_data.derivation_parameters.iterations)
 		
+		this.keys.privateKey = await this.#unwrap_key(this.saved_data.private_key.wrapped_private_key, derived_key, this.saved_data.private_key.iv, ['sign'])
 
-		this.keys.privateKey = await this.unwrap_key(this.saved_data.private_key.wrapped_private_key, derived_key, this.saved_data.private_key.iv, ['sign'])
-
-		this.keys.publicKey = await this.unwrap_key(this.saved_data.public_key.wrapped_public_key, derived_key, this.saved_data.public_key.iv, ['verify'])
+		this.keys.publicKey = await this.#unwrap_key(this.saved_data.public_key.wrapped_public_key, derived_key, this.saved_data.public_key.iv, ['verify'])
 
 		this.auth_id = this.saved_data.auth_id
 		delete this.saved_data
 	}
 
-	async login(auth_data){
+	async login(api_url, auth_data){
 		this.keys = await this.#generate_keys()
 		let raw_public_key = await window.crypto.subtle.exportKey('raw', this.keys.publicKey)
-		this.hex_public_key = this.buf2hex(raw_public_key)
+		this.hex_public_key = this.#buf2hex(raw_public_key)
 		auth_data.public_key = this.hex_public_key
-		let login_result = await this.request('/api/auth', auth_data)
+		let login_result = await this.request(api_url+'auth', auth_data)
 		this.handle_login_result(login_result)
 	}
 
@@ -397,6 +450,6 @@ class MinimAPI_auth_ecdsa extends MinimAPI_auth {
 			this.keys.privateKey,
 			new TextEncoder('utf-8').encode(payload)
 		)
-		return this.auth_id+'.'+this.buf2hex(new Uint8Array(signature))+'.'+timestamp
+		return this.auth_id+'.'+this.#buf2hex(new Uint8Array(signature))+'.'+timestamp
 	}
 }
